@@ -93,7 +93,7 @@ def assess(rows: list[dict], ledger: dict) -> list[dict]:
     for number, row in enumerate(rows, 2):
         errors = base_errors(row)
         if counts[row['id']] > 1:
-            errors.append('ID repetido: se bloquean todas sus filas. Corregí el CSV y volvé a importarlo.')
+            errors.append('ID repetido: se bloquean todas sus filas. Asigná un ID distinto desde el formulario de corrección.')
         previous = ledger.get(row['id'])
         if not errors and previous and fingerprint(row) != fingerprint(previous):
             errors.append('Este ID ya tiene un comprobante con otros datos. Se conserva el original; revisá el ID.')
@@ -104,6 +104,43 @@ def assess(rows: list[dict], ledger: dict) -> list[dict]:
         status = 'error' if errors else ('procesada' if previous else 'pendiente')
         result.append(dict(row=row, fila=number, errors=errors, status=status))
     return result
+
+
+def correct_sale(rows: list[dict], ledger: dict, index: int, changes: dict) -> list[dict]:
+    """Return an independently validated copy. Never mutate rows or the ledger.
+
+    Index identifies the source row even when its ID is duplicated. Validation
+    is repeated at commit time; UI availability alone never grants editability.
+    """
+    if not isinstance(index, int) or not 0 <= index < len(rows):
+        raise ValueError('Elegí una fila disponible.')
+    original = rows[index]
+    if original['id'] in ledger:
+        raise ValueError('Esta venta tiene un comprobante conservado y no se puede editar.')
+    editable = set(BASE[:-1])
+    if not changes or set(changes) - editable or any(not isinstance(v, str) for v in changes.values()):
+        raise ValueError('Sólo podés corregir ID, fecha, cliente, email, concepto e importe.')
+    candidate = {k: original.get(k, '') for k in BASE + EXTRA}
+    candidate.update({k: v.strip() for k, v in changes.items()})
+    if candidate['id'] in ledger:
+        raise ValueError('Ese ID pertenece a un comprobante conservado. Elegí otro ID.')
+    if any(n != index and row['id'] == candidate['id'] for n, row in enumerate(rows)):
+        raise ValueError('Ese ID ya aparece en otra venta. Elegí un ID único.')
+    candidate.update(estado='pendiente', id_demo='', fecha_demo='', errores='')
+    errors = base_errors(candidate)
+    if errors:
+        raise ValueError(' '.join(errors))
+    candidate['importe'] = str(parse_money(candidate['importe']))
+    updated = [dict(row) for row in rows]
+    updated[index] = candidate
+    # Reassess the entire batch: resolving a duplicate releases BOTH valid rows.
+    checked = assess(updated, ledger)
+    if checked[index]['errors']:
+        raise ValueError(' '.join(checked[index]['errors']))
+    for item in checked:
+        item['row']['estado'] = item['status']
+        item['row']['errores'] = ' | '.join(item['errors'])
+    return updated
 
 
 # 2. Adaptador CSV. Un registro incluye ventas + copias inmutables de comprobantes.
@@ -307,153 +344,240 @@ def build_email(snapshot: dict) -> bytes:
 
 
 # 4. UI Streamlit. Los únicos datos mutables están en session_state.
+CSS = '''<style>
+.stApp {background:#faf9fc;color:#302044;font-family:Inter,ui-sans-serif,system-ui,sans-serif;}
+.block-container {max-width:1050px;padding-top:4.3rem;padding-bottom:2rem;}
+h1,h2,h3 {color:#332050!important;letter-spacing:-.035em;}
+h1 {font-size:clamp(1.6rem,3.5vw,2.3rem)!important;line-height:1.15!important;padding:0 0 .35rem!important;}
+h3 {font-size:1.2rem!important;}
+.demo-banner {position:fixed;top:0;left:0;width:100%;z-index:999999;background:#332050;color:#e8f6c5;
+  text-align:center;padding:10px 6px;font-size:12px;font-weight:750;letter-spacing:.035em;}
+.eyebrow {font-size:11px;font-weight:750;letter-spacing:.12em;color:#786487;margin-bottom:4px;}
+.stats {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 8px;}
+.stat {background:white;border:1px solid #e4dceb;border-radius:12px;padding:10px 14px;min-width:0;}
+.stat b {display:block;font-size:23px;color:#332050;line-height:1.2;}
+.stat span {font-size:12px;color:#695b76;}
+.mini-note {font-size:12px;color:#766784;margin:4px 0 8px;}
+.sale-card {padding:14px 16px;background:#fff;border:1px solid #e4dceb;border-radius:12px;margin:7px 0;
+  overflow-wrap:anywhere;}
+.sale-card .meta {font-size:12px;color:#766784;margin-bottom:5px;}
+.sale-card .amount {font-size:19px;font-weight:700;margin:5px 0;}
+.sale-card .issue {font-size:13px;color:#83480b;margin-top:5px;}
+.sale-card .ok {font-size:13px;color:#49651e;}
+button[kind="primary"],button[kind="primaryFormSubmit"] {background:#332050!important;color:white!important;border-color:#332050!important;}
+[data-testid="stDownloadButton"] button {border-radius:9px;border-color:#cabbd9;}
+[data-testid="stHeader"] {top:36px;background:transparent;}
+[data-baseweb="tab-list"] {gap:6px;width:100%;}
+button[data-baseweb="tab"] {flex:1;min-width:0;padding:8px 4px;min-height:44px;}
+button[data-baseweb="tab"][aria-selected="true"] {color:#332050;background:#e8f6c5;border-radius:9px 9px 0 0;}
+[data-testid="stText"] {white-space:pre-wrap;overflow-wrap:anywhere;}
+[data-testid="stText"] pre {white-space:pre-wrap;overflow-wrap:anywhere;}
+.mobile-sales {display:none;}
+@media(max-width:640px) {
+  .block-container {padding-top:4.2rem;padding-left:1rem;padding-right:1rem;}
+  .demo-banner {font-size:11px;}
+  [data-testid="stHeader"] {height:24px;}
+  .stat {padding:8px 9px;}.stat b {font-size:21px;}.stat span {font-size:11px;}
+  button[data-baseweb="tab"] p {font-size:13px;white-space:nowrap;}
+  [data-testid="stFormSubmitButton"] button,[data-testid="stDownloadButton"] button {width:100%;min-height:44px;}
+  .st-key-sales-table {display:none;}.mobile-sales {display:block;}
+  [data-testid="stTextInput"] input {font-size:16px;}
+}
+</style><div class="demo-banner">DEMOSTRACIÓN · Sin validez fiscal</div>'''
+
+
+def render_help(st):
+    with st.expander('Cómo funciona'):
+        st.write('**1 · Revisar:** cargá un CSV o usá el ejemplo. Elegí una fila y corregí sus datos. Sólo se guarda si queda válida. Las ventas con comprobante están bloqueadas.')
+        st.write('**2 · Preparar:** revisá y aprobá cada venta. Descargá su PDF demo o el correo preparado con el PDF adjunto. No se envía ningún correo.')
+        st.write('**3 · Resumen:** elegí el mes y descargá el resumen administrativo de ejemplo. Los errores no suman importes.')
+        st.write('**Guardá tu trabajo:** la app usa memoria de sesión. Una recarga completa, desconexión o reinicio puede borrar los cambios. Descargá el registro actualizado y reimportalo para recuperar estados, IDs y PDF. El CSV original no incluye correcciones de pantalla.')
+        st.write(FISCAL_NOTE + '. No se calcula IVA ni se emiten facturas autorizadas.')
+        st.write('**CSV:** ' + ', '.join(BASE) + '. UTF-8, separado por comas o punto y coma. Fecha AAAA-MM-DD. Importe sin miles, con hasta 2 decimales. Máximo 2 MB y 5.000 filas; sólo datos ficticios y correos @example.com.')
+        st.write('**Google Sheets:** Archivo → Descargar → Valores separados por comas. Para devolver el registro: Archivo → Importar → Subir → Insertar hojas nuevas. Conservá todas las columnas y filas de tipo comprobante: son el respaldo. Filtrá tipo_registro = venta para ver sólo ventas. No sumes ambos tipos juntos.')
+        st.caption('Sin conexión a Sheets o ARCA, sin ejecución automática 24/7 y sin almacenamiento permanente en el servidor. El respaldo no está firmado ni autenticado.')
+
+
+def save_correction_callback(index, generation, keys):
+    import streamlit as st
+    state = st.session_state
+    try:
+        if state.generation != generation:
+            raise ValueError('Los datos cambiaron. Volvé a elegir la fila.')
+        changes = {field: state[key] for field, key in keys.items()}
+        state.rows = correct_sale(state.rows, state.ledger, index, changes)
+        state.generation += 1
+        state.flash = 'Corrección guardada. Podés aprobar la venta en «2 · Preparar».'
+    except ValueError as exc:
+        state.correction_error = str(exc)
+
+
+def approve_callback(index, generation, confirmation_key):
+    import streamlit as st
+    state = st.session_state
+    try:
+        if state.generation != generation:
+            raise ValueError('Los datos cambiaron. Volvé a revisar la venta.')
+        snap, created = approve(state.rows, state.ledger, index, state[confirmation_key])
+        state.last_demo = snap['id']
+        state.generation += 1
+        state.flash = 'Comprobante demo preparado. Ya podés descargarlo.' if created else 'El comprobante ya existe. Podés descargarlo otra vez.'
+    except ValueError as exc:
+        state.approval_error = str(exc)
+
+
+def render_correction(st, state, checked):
+    editable = [n for n, item in enumerate(checked) if item['row']['id'] not in state.ledger]
+    st.subheader('Corregir una venta')
+    if not editable:
+        st.info('Las ventas de este archivo tienen comprobantes conservados. No se pueden editar.')
+        return
+    # First error by default. The row number disambiguates repeated IDs.
+    first = next((n for n in editable if checked[n]['errors']), editable[0])
+    index = st.selectbox('Fila para corregir', editable, index=editable.index(first),
+                         format_func=lambda n, sales=state.rows: f'Fila {n + 2} · {sales[n]["id"] or "Sin ID"} · {sales[n]["cliente"]}',
+                         key=f'edit_selection_{state.generation}')
+    row = state.rows[index]
+    if checked[index]['errors']:
+        st.warning(' '.join(checked[index]['errors']))
+    st.caption('El ID debe ser único. Guardar una corrección no aprueba la venta.')
+    keys = {field: f'edit_{state.generation}_{index}_{field}' for field in BASE[:-1]}
+    with st.form(f'correction_{state.generation}_{index}'):
+        left, right = st.columns(2)
+        with left:
+            st.text_input('ID de venta', value=row['id'], key=keys['id'])
+        with right:
+            st.text_input('Fecha de venta', value=row['fecha'], help='Formato AAAA-MM-DD.', key=keys['fecha'])
+        st.text_input('Cliente ficticio', value=row['cliente'], key=keys['cliente'])
+        st.text_input('Email de ejemplo', value=row['email'], key=keys['email'])
+        st.text_input('Concepto', value=row['concepto'], key=keys['concepto'])
+        st.text_input('Importe en pesos', value=row['importe'], help='Ejemplo: 85000,50. Sin separadores de miles.', key=keys['importe'])
+        st.form_submit_button('Guardar corrección', type='primary', on_click=save_correction_callback,
+                              args=(index, state.generation, keys))
+    if 'correction_error' in state:
+        st.error(state.pop('correction_error'))
+    if any(r['id'] in state.ledger for r in state.rows):
+        st.caption('Las filas con un ID que tiene comprobante quedan fuera del formulario, incluso si presentan errores.')
+
+
 def main():
     import pandas as pd
     import streamlit as st
     st.set_page_config(page_title='De la venta al comprobante · Loopian', page_icon='🟣', layout='wide')
-    st.markdown('''<style>
-    .stApp {background:#faf9fc;color:#302044;font-family:Inter,ui-sans-serif,system-ui,sans-serif;}
-    .block-container {max-width:1120px;padding-top:5.2rem;padding-bottom:3rem;}
-    h1,h2,h3 {color:#332050!important;letter-spacing:-.035em;}
-    h1 {font-size:clamp(2rem,4vw,3.1rem)!important;line-height:1.12!important;}
-    .demo-banner {position:fixed;top:0;left:0;width:100%;z-index:999999;background:#332050;
-      color:#e8f6c5;text-align:center;padding:12px 8px;font-size:13px;font-weight:750;letter-spacing:.06em;}
-    .eyebrow {font-weight:750;font-size:12px;letter-spacing:.14em;color:#665078;margin-bottom:12px;}
-    .intro {color:#6f627d;font-size:17px;max-width:700px;line-height:1.6;}
-    .steps {display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:26px 0;}
-    .step {padding:17px;border:1px solid #e2dbea;background:white;border-radius:14px;font-size:14px;font-weight:650;}
-    .step b {display:inline-grid;place-items:center;width:28px;height:28px;background:#d5f58a;color:#332050;border-radius:50%;margin-right:7px;}
-    .cards {display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:18px 0 24px;}
-    .card {padding:22px;background:#fff;border:1px solid #e8e1ee;border-radius:18px;}
-    .card .label {color:#746880;font-size:13px;margin-bottom:7px;}
-    .card .value {font-size:27px;font-weight:750;line-height:1.3;}
-    .card .sub {font-size:12px;color:#746880;margin-top:8px;}
-    button[kind="primary"],button[kind="primaryFormSubmit"] {background:#332050!important;color:white!important;border-color:#332050!important;}
-    [data-testid="stDownloadButton"] button {border-radius:10px;border-color:#cabbd9;}
-    [data-testid="stVerticalBlockBorderWrapper"] {border-radius:16px;}
-    [data-testid="stHeader"] {top:42px;background:transparent;}
-    @media(max-width:640px) {
-      .block-container {padding-top:6rem;padding-left:1rem;padding-right:1rem;}
-      .steps {grid-template-columns:1fr;gap:7px;margin:20px 0;}.step {padding:10px 13px;}
-      .cards {grid-template-columns:1fr;gap:9px;}.card {padding:15px 18px;}.card .value{font-size:24px;}
-      .demo-banner {font-size:11px;padding:12px 5px;}
-    }
-    </style><div class="demo-banner">DEMOSTRACIÓN · Sin validez fiscal</div>''', unsafe_allow_html=True)
+    st.markdown(CSS, unsafe_allow_html=True)
     if 'ledger' not in st.session_state:
         st.session_state.rows, st.session_state.ledger = import_csv(EXAMPLE.encode(), {})
         st.session_state.source = 'Ejemplo incorporado · septiembre 2026'
         st.session_state.original = EXAMPLE.encode('utf-8-sig')
         st.session_state.generation = 0
     state = st.session_state
-    if 'flash' in state:
-        st.success(state.pop('flash'))
-    st.markdown('<div class="eyebrow">LOOPIAN / DE LA PLANILLA A UNA HERRAMIENTA</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">LOOPIAN / DEMO ADMINISTRATIVA</div>', unsafe_allow_html=True)
     st.title('De la venta al comprobante')
-    st.markdown('<p class="intro">Revisá tus ventas, prepará comprobantes de ejemplo y cerrá el mes con todo a mano.</p>', unsafe_allow_html=True)
-    st.markdown('<div class="steps"><div class="step"><b>1</b> Revisar ventas</div><div class="step"><b>2</b> Preparar comprobantes</div><div class="step"><b>3</b> Resumen mensual</div></div>', unsafe_allow_html=True)
-    st.info('Esta demo usa memoria de sesión. Descargá el registro actualizado para conservarlo y reimportarlo. Recargar la página o cerrar la sesión puede borrar los cambios.')
-    st.caption(FISCAL_NOTE + '.')
-    with st.expander('Cargar CSV o recuperar un registro · ayuda y ejemplo'):
-        st.write('Usá datos ficticios. Importar reemplaza las ventas en revisión y conserva los comprobantes ya preparados en esta sesión. Descargá el registro antes de cambiar de archivo.')
-        upload = st.file_uploader('Elegí un CSV de ventas o un registro actualizado', type=['csv'], key=f'upload_{state.generation}')
-        if st.button('Importar CSV', disabled=upload is None):
-            try:
-                data = upload.getvalue()
-                rows, ledger = import_csv(data, state.ledger)
-                state.rows, state.ledger = rows, ledger
-                state.original, state.source = data, upload.name
-                state.generation += 1
-                state.flash = 'Archivo importado. Revisá los errores antes de aprobar.'
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
-        st.download_button('Descargar ventas de ejemplo', EXAMPLE.encode('utf-8-sig'), 'ventas_ejemplo.csv', 'text/csv')
-        st.caption('Columnas: ' + ', '.join(BASE) + '. Fechas AAAA-MM-DD; importes sin miles y con hasta 2 decimales. Máximo 2 MB / 5.000 filas. Se acepta coma o punto y coma como separador.')
-        st.write('**Google Sheets:** Archivo → Descargar → Valores separados por comas (.csv, hoja actual). Para llevar el resultado de vuelta: Archivo → Importar → Subir → Insertar hojas nuevas. Conservá todas las columnas y las filas de tipo comprobante; son el respaldo para reconstruir los PDF. Para ver sólo ventas, filtrá tipo_registro = venta. No hay sincronización automática.')
-        st.write('**Para reiniciar la grabación:** primero descargá el registro si querés conservarlo.')
-        confirmed_reset = st.checkbox('Confirmo borrar los cambios de esta sesión y volver a las 5 filas del ejemplo', key=f'reset_{state.generation}')
-        if st.button('Restablecer ejemplo', disabled=not confirmed_reset):
-            state.rows, state.ledger = import_csv(EXAMPLE.encode(), {})
-            state.original, state.source = EXAMPLE.encode('utf-8-sig'), 'Ejemplo incorporado · septiembre 2026'
-            state.generation += 1
-            state.flash = 'Ejemplo restablecido.'
-            st.rerun()
+    st.caption('Sólo memoria de sesión: descargá el registro para conservar los cambios.')
+    render_help(st)
+    flash = st.empty()  # Keep the tab container in a stable position across reruns.
+    if 'flash' in state:
+        flash.success(state.pop('flash'))
+    review_tab, prepare_tab, summary_tab = st.tabs(['1 · Revisar', '2 · Preparar', '3 · Resumen'], key='workflow')
     checked = assess(state.rows, state.ledger)
     pending = [i for i in checked if i['status'] == 'pendiente']
     errors = [i for i in checked if i['errors']]
-    pending_amount = sum((parse_money(i['row']['importe']) for i in pending), Decimal('0.00'))
-    demo_amount = sum((parse_money(r['importe']) for r in state.ledger.values()), Decimal('0.00'))
-    st.markdown(f'''<div class="cards">
-    <div class="card"><div class="label">Ventas pendientes válidas</div><div class="value">{money(pending_amount)}</div><div class="sub">{len(pending)} ventas listas para revisar</div></div>
-    <div class="card"><div class="label">Comprobantes demo conservados</div><div class="value">{money(demo_amount)}</div><div class="sub">{len(state.ledger)} comprobantes · todos los meses</div></div>
-    <div class="card"><div class="label">Filas que necesitan revisión</div><div class="value">{len(errors)}</div><div class="sub">Sus importes se excluyen de los totales</div></div></div>''', unsafe_allow_html=True)
-    st.subheader('1. Revisar ventas')
-    st.caption('Archivo activo: ' + state.source)
-    view = []
-    for i in checked:
-        r = i['row']
-        view.append({'Fila': i['fila'], 'ID': r['id'], 'Fecha': r['fecha'], 'Cliente': r['cliente'],
-                     'Importe (ARS)': r['importe'], 'Estado': {'pendiente': 'Pendiente', 'procesada': 'Procesada', 'error': 'Revisar'}[i['status']],
-                     'Observación': ' | '.join(i['errors']) or 'Sin errores'})
-    st.dataframe(pd.DataFrame(view), hide_index=True, width='stretch')
-    if errors:
-        st.warning(f'{len(errors)} filas bloqueadas. Corregí el archivo de origen y volvé a importarlo; no se elige automáticamente entre IDs repetidos.')
-        with st.expander('Ver qué corregir', expanded=True):
-            for i in errors:
-                st.text(f'Fila {i["fila"]} · {i["row"]["id"] or "Sin ID"}: ' + ' '.join(i['errors']))
-    st.download_button('Descargar CSV original', state.original, 'ventas_original.csv', 'text/csv')
-    st.subheader('2. Preparar comprobantes')
-    st.caption('Elegí una venta y aprobala expresamente. No se calcula IVA ni se autoriza una factura.')
-    indices = [idx for idx, i in enumerate(checked) if i['status'] == 'pendiente']
-    if indices:
-        index = st.selectbox('Venta para revisar', indices,
-                             format_func=lambda n, sales=state.rows: sales[n]['id'] + ' · ' + sales[n]['cliente'],
-                             key=f'selection_{state.generation}')
-        r = state.rows[index]
-        with st.container(border=True):
-            st.text(f'{r["cliente"]}\n{r["email"]}\nFecha de venta: {r["fecha"]}')
-            st.text(r['concepto'])
-            st.metric('Importe registrado · ARS', money(parse_money(r['importe'])))
-            with st.form(f'approve_{state.generation}_{r["id"]}'):
-                confirm = st.checkbox('Revisé los datos y apruebo esta venta para un comprobante DEMOSTRATIVO')
-                submit = st.form_submit_button('Aprobar y generar comprobante demo', type='primary')
-            if submit:
+    with review_tab:
+        st.markdown(f'<div class="stats"><div class="stat"><b>{len(pending)}</b><span>Pendientes</span></div>'
+                    f'<div class="stat"><b>{len(state.ledger)}</b><span>Demo conservados</span></div>'
+                    f'<div class="stat"><b>{len(errors)}</b><span>Con errores</span></div></div>', unsafe_allow_html=True)
+        st.caption('Archivo: ' + state.source)
+        with st.expander('Cargar CSV o recuperar registro'):
+            st.caption('Reemplaza las ventas en revisión y conserva los comprobantes de esta sesión. Descargá antes tu registro.')
+            upload = st.file_uploader('Elegí un CSV', type=['csv'], key=f'upload_{state.generation}')
+            if st.button('Importar CSV', disabled=upload is None):
                 try:
-                    snap, created = approve(state.rows, state.ledger, index, confirm)
-                    state.last_demo = snap['id']
+                    data = upload.getvalue()
+                    rows, ledger = import_csv(data, state.ledger)
+                    state.rows, state.ledger = rows, ledger
+                    state.original, state.source = data, upload.name
                     state.generation += 1
-                    state.flash = 'Comprobante demo preparado. Descargá el PDF, el correo y el registro actualizado.' if created else 'Este comprobante ya existe. Podés volver a descargarlo.'
+                    state.flash = 'Archivo importado. Revisá las ventas.'
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
-    else:
-        st.info('No hay ventas válidas pendientes. Revisá los errores o descargá los comprobantes disponibles.')
-    if state.ledger:
-        ids = list(state.ledger)
-        default = ids.index(state.last_demo) if state.get('last_demo') in ids else 0
-        selected = st.selectbox('Comprobantes disponibles para descargar', ids, index=default,
-                                format_func=lambda k, history=state.ledger: k + ' · ' + history[k]['cliente'])
-        snap = state.ledger[selected]
-        st.caption(snap['id_demo'] + ' · Preparado el ' + snap['fecha_demo'] + ' (UTC). Volver a descargar conserva el mismo ID.')
-        st.download_button('Descargar PDF demo', build_pdf(snap), snap['id_demo'] + '.pdf', 'application/pdf')
-        st.download_button('Descargar correo preparado', build_email(snap), snap['id_demo'] + '.eml', 'message/rfc822')
-        st.caption('El .eml incluye el PDF adjunto. Podés abrirlo en un cliente de correo compatible. La app no envía correos.')
-    st.subheader('3. Resumen mensual')
-    st.caption('Resumen administrativo de ejemplo · agrupado por mes de la venta, no por fecha de preparación. Los comprobantes conservados se cuentan una sola vez, aunque cargues otro CSV.')
-    months = sorted({r['fecha'][:7] for r in state.rows + list(state.ledger.values()) if valid_date(r['fecha'])}, reverse=True)
-    month = st.selectbox('Mes de las ventas', months or [date.today().strftime('%Y-%m')])
-    summary = monthly_summary(state.rows, state.ledger, month)
-    st.dataframe(pd.DataFrame([{'Categoría': r['categoria'], 'Cantidad': r['cantidad'],
-                               'Importe (ARS)': money(Decimal(r['importe_ars'])) if r['importe_ars'] else 'Excluido'} for r in summary]),
-                 hide_index=True, width='stretch')
-    st.caption('Errores = cantidad de filas, no cantidad de mensajes. Las fechas inválidas se informan aparte, sin asignarlas a un mes. Los importes de errores no se suman.')
-    st.download_button('Descargar resumen mensual CSV', csv_bytes(summary, ['mes', 'categoria', 'cantidad', 'importe_ars', 'nota']),
-                       f'resumen_administrativo_{month}.csv', 'text/csv')
+            st.download_button('Descargar ventas de ejemplo', EXAMPLE.encode('utf-8-sig'), 'ventas_ejemplo.csv', 'text/csv')
+        render_correction(st, state, checked)
+        with st.expander('Ver todas las ventas'):
+            view = []
+            cards = []
+            for item in checked:
+                r = item['row']
+                status = {'pendiente': 'Pendiente', 'procesada': 'Procesada', 'error': 'Revisar'}[item['status']]
+                view.append({'Fila': item['fila'], 'ID': r['id'], 'Fecha': r['fecha'], 'Cliente': r['cliente'],
+                             'Importe (ARS)': r['importe'], 'Estado': status, 'Observación': ' | '.join(item['errors']) or 'Sin errores'})
+                # All CSV text is escaped before inserting into the mobile HTML cards.
+                details = escape(' '.join(item['errors'])) if item['errors'] else 'Sin errores'
+                cards.append(f'<div class="sale-card"><div class="meta">Fila {item["fila"]} · {escape(r["id"])} · {escape(status)}</div>'
+                             f'<strong>{escape(r["cliente"])}</strong><div class="meta">{escape(r["fecha"])}</div>'
+                             f'<div class="amount">ARS {escape(r["importe"])}</div><div class="issue">{details}</div></div>')
+            with st.container(key='sales-table'):
+                st.dataframe(pd.DataFrame(view), hide_index=True, width='stretch')
+            st.markdown('<div class="mobile-sales">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+        st.download_button('Descargar CSV original', state.original, 'ventas_original.csv', 'text/csv')
+        with st.expander('Restablecer el ejemplo'):
+            st.caption('Descargá el registro antes si querés conservar los cambios.')
+            confirmed_reset = st.checkbox('Confirmo borrar los cambios de esta sesión y volver a las 5 filas del ejemplo', key=f'reset_{state.generation}')
+            if st.button('Restablecer ejemplo', disabled=not confirmed_reset):
+                state.rows, state.ledger = import_csv(EXAMPLE.encode(), {})
+                state.original, state.source = EXAMPLE.encode('utf-8-sig'), 'Ejemplo incorporado · septiembre 2026'
+                state.generation += 1
+                state.flash = 'Ejemplo restablecido.'
+                st.rerun()
+    with prepare_tab:
+        st.subheader('Preparar un comprobante demo')
+        indices = [idx for idx, i in enumerate(checked) if i['status'] == 'pendiente']
+        if indices:
+            index = st.selectbox('Venta para revisar', indices,
+                                 format_func=lambda n, sales=state.rows: sales[n]['id'] + ' · ' + sales[n]['cliente'],
+                                 key=f'selection_{state.generation}')
+            r = state.rows[index]
+            with st.container(border=True):
+                st.text(f'{r["cliente"]}\n{r["email"]}\nFecha de venta: {r["fecha"]}')
+                st.text(r['concepto'])
+                st.metric('Importe registrado · ARS', money(parse_money(r['importe'])))
+                confirmation_key = f'confirm_{state.generation}_{r["id"]}'
+                with st.form(f'approve_{state.generation}_{r["id"]}'):
+                    st.checkbox('Revisé los datos y apruebo esta venta para un comprobante DEMOSTRATIVO', key=confirmation_key)
+                    st.form_submit_button('Aprobar y generar comprobante demo', type='primary',
+                                          on_click=approve_callback, args=(index, state.generation, confirmation_key))
+                if 'approval_error' in state:
+                    st.error(state.pop('approval_error'))
+        else:
+            st.info('No hay ventas válidas pendientes. Revisá «1 · Revisar».')
+        if state.ledger:
+            st.subheader('Descargar comprobantes')
+            ids = list(state.ledger)
+            default = ids.index(state.last_demo) if state.get('last_demo') in ids else 0
+            selected = st.selectbox('Comprobantes disponibles para descargar', ids, index=default,
+                                    format_func=lambda k, history=state.ledger: k + ' · ' + history[k]['cliente'])
+            snap = state.ledger[selected]
+            st.caption(snap['id_demo'] + ' · ' + snap['fecha_demo'] + ' (UTC)')
+            st.download_button('Descargar PDF demo', build_pdf(snap), snap['id_demo'] + '.pdf', 'application/pdf')
+            st.download_button('Descargar correo preparado', build_email(snap), snap['id_demo'] + '.eml', 'message/rfc822')
+            st.caption('El correo incluye el PDF adjunto. La app no lo envía.')
+    with summary_tab:
+        st.subheader('Resumen mensual')
+        st.caption('Resumen administrativo de ejemplo, por mes de la venta.')
+        months = sorted({r['fecha'][:7] for r in state.rows + list(state.ledger.values()) if valid_date(r['fecha'])}, reverse=True)
+        month = st.selectbox('Mes de las ventas', months or [date.today().strftime('%Y-%m')])
+        summary = monthly_summary(state.rows, state.ledger, month)
+        for item in summary:
+            amount = money(Decimal(item['importe_ars'])) if item['importe_ars'] else 'Importe excluido'
+            st.markdown(f'<div class="sale-card"><div class="meta">{escape(item["categoria"])}</div>'
+                        f'<strong>{item["cantidad"]} registros</strong><div class="amount">{escape(amount)}</div></div>', unsafe_allow_html=True)
+        st.caption('Errores por fila. Las fechas inválidas se informan aparte. Cada comprobante se cuenta una sola vez.')
+        st.download_button('Descargar resumen mensual CSV', csv_bytes(summary, ['mes', 'categoria', 'cantidad', 'importe_ars', 'nota']),
+                           f'resumen_administrativo_{month}.csv', 'text/csv')
+    # Always reachable from any tab, with up-to-date corrections and immutable snapshots.
     st.download_button('Descargar registro actualizado CSV', export_registry(state.rows, state.ledger),
-                       'registro_actualizado.csv', 'text/csv', type='primary')
-    st.caption('Guardá este registro completo: contiene ventas y filas de respaldo de comprobantes. Reimportalo para recuperar estados, IDs y PDF. No es una base fiscal ni un archivo firmado.')
-    st.divider()
-    st.caption(DISCLAIMER + ' · Hecho para aprender con Loopian. Sin conexión a Sheets o ARCA, sin tareas automáticas y sin APIs pagas.')
+                       'registro_actualizado.csv', 'text/csv', type='primary', width='stretch')
+    st.caption('Tu respaldo completo para recuperar ventas y comprobantes.')
 
 
 if __name__ == '__main__':

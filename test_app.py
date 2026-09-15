@@ -163,6 +163,86 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(app.monthly_summary(self.rows, self.ledger, '2026-10')[0]['cantidad'], 0)
 
 
+class CorrectionTests(unittest.TestCase):
+    def setUp(self):
+        self.rows, self.ledger = app.import_csv(app.EXAMPLE.encode(), {})
+
+    def test_correct_duplicate_id_revalidates_both_rows(self):
+        updated = app.correct_sale(self.rows, self.ledger, 2, {'id': 'V005'})
+        checked = app.assess(updated, self.ledger)
+        self.assertEqual([i['status'] for i in checked], ['pendiente'] * 4 + ['error'])
+        self.assertEqual(self.rows[2]['id'], 'V003')
+        self.assertEqual(app.monthly_summary(updated, self.ledger, '2026-09')[1]['importe_ars'], '310000.50')
+        self.assertFalse(self.ledger)
+
+    def test_correct_invalid_amount_with_decimal_comma(self):
+        updated = app.correct_sale(self.rows, self.ledger, 4, {'importe': ' 17500,25 '})
+        self.assertEqual(updated[4]['importe'], '17500.25')
+        self.assertEqual(app.assess(updated, self.ledger)[4]['status'], 'pendiente')
+        self.assertEqual(app.monthly_summary(updated, self.ledger, '2026-09')[1]['importe_ars'], '227500.75')
+
+    def test_new_duplicate_id_rejected_without_mutation(self):
+        original = copy.deepcopy(self.rows)
+        with self.assertRaisesRegex(ValueError, 'otra venta'):
+            app.correct_sale(self.rows, self.ledger, 0, {'id': 'V002'})
+        self.assertEqual(self.rows, original)
+        self.assertFalse(self.ledger)
+
+    def test_processed_sale_cannot_change_even_its_id(self):
+        app.approve(self.rows, self.ledger, 0, True)
+        original, history = copy.deepcopy(self.rows), copy.deepcopy(self.ledger)
+        for changes in [{'id': 'NUEVO'}, {'importe': '1'}, {'cliente': 'Otro'}]:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'no se puede editar'):
+                app.correct_sale(self.rows, self.ledger, 0, changes)
+        self.assertEqual(self.rows, original)
+        self.assertEqual(self.ledger, history)
+
+    def test_error_row_with_preserved_id_also_locked(self):
+        app.approve(self.rows, self.ledger, 0, True)
+        changed = copy.deepcopy(self.rows)
+        changed[0]['importe'] = 'inválido'
+        self.assertEqual(app.assess(changed, self.ledger)[0]['status'], 'error')
+        with self.assertRaisesRegex(ValueError, 'no se puede editar'):
+            app.correct_sale(changed, self.ledger, 0, {'id': 'V009', 'importe': '2'})
+
+    def test_cannot_take_history_id_missing_from_current_csv(self):
+        app.approve(self.rows, self.ledger, 0, True)
+        remaining = self.rows[1:]
+        with self.assertRaisesRegex(ValueError, 'comprobante conservado'):
+            app.correct_sale(remaining, self.ledger, 0, {'id': 'V001'})
+
+    def test_invalid_correction_is_atomic_and_revalidates_all_fields(self):
+        original = copy.deepcopy(self.rows)
+        for changes in [{'importe': 'NaN'}, {'fecha': '2026-02-30'}, {'email': 'real@otro.com'}, {'id': ' '}, {'estado': 'procesada'}]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                app.correct_sale(self.rows, self.ledger, 0, changes)
+        self.assertEqual(self.rows, original)
+
+    def test_corrections_survive_backup_without_changing_pdf_history(self):
+        snap, _ = app.approve(self.rows, self.ledger, 0, True)
+        old_pdf = app.build_pdf(snap)
+        history = copy.deepcopy(self.ledger)
+        corrected = app.correct_sale(self.rows, self.ledger, 2, {'id': 'V005'})
+        corrected = app.correct_sale(corrected, self.ledger, 4, {'importe': '17500.25'})
+        backup = app.export_registry(corrected, self.ledger)
+        restored, ledger = app.import_csv(backup, {})
+        self.assertEqual(self.ledger, history)
+        self.assertEqual(ledger, history)
+        self.assertEqual(app.build_pdf(ledger['V001']), old_pdf)
+        self.assertEqual([r['status'] for r in app.assess(restored, ledger)], ['procesada'] + ['pendiente'] * 4)
+        self.assertEqual(app.export_registry(restored, ledger), backup)
+        self.assertFalse(app.approve(restored, ledger, 0, True)[1])
+
+    def test_corrected_sale_still_requires_explicit_approval(self):
+        updated = app.correct_sale(self.rows, self.ledger, 4, {'importe': '99.99'})
+        with self.assertRaises(ValueError):
+            app.approve(updated, self.ledger, 4, False)
+        snap, created = app.approve(updated, self.ledger, 4, True)
+        self.assertTrue(created)
+        self.assertEqual(snap['importe'], '99.99')
+        self.assertFalse(app.approve(updated, self.ledger, 4, True)[1])
+
+
 class StreamlitTests(unittest.TestCase):
     def load(self):
         from streamlit.testing.v1 import AppTest
@@ -204,6 +284,75 @@ class StreamlitTests(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertEqual(len(at.session_state['ledger']), 1)
         self.assertIn('Descargar PDF demo', [d.label for d in at.get('download_button')])
+
+
+    @staticmethod
+    def input(at, label):
+        return next(w for w in at.text_input if w.label == label)
+
+    @staticmethod
+    def select(at, label):
+        return next(w for w in at.selectbox if w.label == label)
+
+    def test_tabs_corrections_and_approval_flow(self):
+        at = self.load()
+        self.assertEqual([t.label for t in at.tabs], ['1 · Revisar', '2 · Preparar', '3 · Resumen'])
+        self.assertEqual(self.select(at, 'Fila para corregir').value, 2)
+        self.input(at, 'ID de venta').set_value('V005')
+        self.button(at, 'Guardar corrección').click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(at.session_state['rows'][2]['id'], 'V005')
+        # The remaining invalid amount is selected automatically after revalidation.
+        self.assertEqual(self.select(at, 'Fila para corregir').value, 4)
+        self.input(at, 'Importe en pesos').set_value('17500,25')
+        self.button(at, 'Guardar corrección').click().run()
+        self.assertFalse(at.exception)
+        self.assertFalse(any(i['errors'] for i in app.assess(at.session_state['rows'], at.session_state['ledger'])))
+        self.select(at, 'Venta para revisar').select(2).run()
+        next(c for c in at.checkbox if c.label.startswith('Revisé')).check().run()
+        self.button(at, 'Aprobar y generar comprobante demo').click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.session_state['ledger']), 1)
+        self.assertIn('V005', at.session_state['ledger'])
+        self.assertFalse(any(label.startswith('Fila 4 ·') for label in self.select(at, 'Fila para corregir').options))
+        downloads = [d.label for d in at.get('download_button')]
+        for label in ['Descargar PDF demo', 'Descargar correo preparado', 'Descargar registro actualizado CSV', 'Descargar resumen mensual CSV']:
+            self.assertIn(label, downloads)
+        at.run()
+        self.assertEqual(len(at.session_state['ledger']), 1)
+
+    def test_ui_rejects_duplicate_then_accepts_retry(self):
+        at = self.load()
+        before = copy.deepcopy(at.session_state['rows'])
+        self.input(at, 'ID de venta').set_value('V001')
+        self.button(at, 'Guardar corrección').click().run()
+        self.assertFalse(at.exception)
+        self.assertTrue(at.error)
+        self.assertEqual(at.session_state['rows'], before)
+        self.assertEqual(self.input(at, 'ID de venta').value, 'V001')
+        self.input(at, 'ID de venta').set_value('V006')
+        self.button(at, 'Guardar corrección').click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(at.session_state['rows'][2]['id'], 'V006')
+
+    def test_ui_excludes_conflicting_processed_id(self):
+        at = self.load()
+        rows, ledger = app.import_csv(app.EXAMPLE.encode(), {})
+        app.approve(rows, ledger, 0, True)
+        rows[0]['importe'] = 'importe incorrecto'
+        at.session_state['rows'], at.session_state['ledger'] = rows, ledger
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertFalse(any(label.startswith('Fila 2 ·') for label in self.select(at, 'Fila para corregir').options))
+        self.assertEqual(len(at.session_state['ledger']), 1)
+
+    def test_ui_correction_clears_previous_approval(self):
+        at = self.load()
+        next(c for c in at.checkbox if c.label.startswith('Revisé')).check().run()
+        self.input(at, 'ID de venta').set_value('V005')
+        self.button(at, 'Guardar corrección').click().run()
+        self.assertFalse(next(c for c in at.checkbox if c.label.startswith('Revisé')).value)
+        self.assertEqual(len(at.session_state['ledger']), 0)
 
 
 if __name__ == '__main__':
