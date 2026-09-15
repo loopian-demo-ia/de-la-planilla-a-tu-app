@@ -60,7 +60,7 @@ gatherUsageStats = false
 7. En **Advanced settings**, elegí **Python 3.11**, que es la versión probada. Dejá vacío el campo de secretos: esta app no los necesita.
 8. Presioná **Deploy**. Cuando termine la instalación, abrí el enlace que te entregue Streamlit. Los nombres de los botones de GitHub y Streamlit pueden aparecer en inglés.
 
-La publicación gratuita y el flujo de repositorio/rama/archivo están documentados por [Streamlit](https://streamlit.io/) y en su [guía oficial de despliegue](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy). Consultados el 15/09/2026. El proyecto se entrega preparado; no está publicado ni vinculado a tu cuenta.
+La publicación gratuita y el flujo de repositorio/rama/archivo están documentados por [Streamlit](https://streamlit.io/) y en su [guía oficial de despliegue](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy). Consultados el 15/09/2026. La instancia de ejemplo está publicada; para tener tu propia copia, seguí estos pasos en tus cuentas.
 
 Si aparece `ModuleNotFoundError`, comprobá que `requirements.txt` esté junto a `app.py`. Si no encuentra el archivo principal, revisá que no hayas subido toda la carpeta dentro de otra carpeta. Guardá `.streamlit/config.toml` para fijar el tema claro.
 
@@ -193,7 +193,7 @@ python -m unittest -v test_app.py
 
 En la primera versión se generó y revisó visualmente un PDF de ejemplo. El generador PDF y el correo no cambiaron; las pruebas de regresión vuelven a verificar su contenido, reconstrucción y adjunto.
 
-**Pendiente:** desplegar en tu cuenta de Community Cloud y probar allí la carga/descarga real desde el navegador, la vista de escritorio y celular (por ejemplo, 390 × 844), y abrir el `.eml` en tu cliente de correo. El navegador de revisión bloqueó la dirección local con `net::ERR_BLOCKED_BY_CLIENT`; no se presenta una revisión visual de la app como realizada. La interfaz incluye ajustes responsive, pero AppTest no comprueba el diseño ni las descargas reales.
+**Verificación adicional de publicación (15/09/2026):** las 32 pruebas también pasaron con Python 3.11. La app se desplegó en Community Cloud con esa versión. En un navegador real se verificaron las tres pestañas, la corrección de ID e importe, la aprobación, la descarga de PDF/correo/CSV y la recuperación del mismo PDF (comparación byte por byte) desde una sesión nueva. Se probaron las tres pestañas a 390 × 844 sin desborde horizontal. El correo se descarga y contiene el PDF; su presentación como borrador depende del cliente de correo que uses. No se probó un envío porque esta app no envía correos.
 
 El estado de sesión y sus límites están explicados en la [documentación oficial de Streamlit](https://docs.streamlit.io/develop/api-reference/caching-and-state/st.session_state).
 
