@@ -1,0 +1,6 @@
+﻿id,fecha,cliente,email,concepto,importe,estado
+V001,2026-09-03,Estudio Jacarandá (ficticio),jacaranda@example.com,Edición de videos,85000.00,pendiente
+V002,2026-09-07,Café Horizonte (ficticio),horizonte@example.com,Gestión de redes,125000.50,pendiente
+V003,2026-09-10,Taller Nube (ficticio),nube@example.com,Diseño de piezas,42000.00,pendiente
+V003,2026-09-11,Librería Brisa (ficticia),brisa@example.com,Producción de contenido,58000.00,pendiente
+V004,2026-09-14,Proyecto Lima (ficticio),lima@example.com,Edición de reel,no_es_un_importe,pendiente
